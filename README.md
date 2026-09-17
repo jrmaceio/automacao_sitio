@@ -22,9 +22,11 @@ Arapiraca, AL
 
 União dos Palmares, AL (planejada — ainda sem firmware próprio neste repositório)
 
-🔥 Firmware único: `automacao_sitio.ino`
+🔥 Firmware único: `automacao_sitio/automacao_sitio.ino`
 
-A partir desta versão, **existe um único arquivo de firmware** (`automacao_sitio.ino`) usado em todas as estações — não é mais necessário manter um `.ino` separado por estação. Os arquivos antigos `UmidTempDth22Arapiraca.ino` e `UmidTempDth22BeloMonte.ino` continuam no repositório apenas como referência histórica e não devem mais ser usados para novas gravações.
+A partir desta versão, **existe um único arquivo de firmware** (`automacao_sitio/automacao_sitio.ino`) usado em todas as estações — não é mais necessário manter um `.ino` separado por estação. Os sketches antigos (`UmidTempDth22Arapiraca/`, `UmidTempDth22BeloMonte/`, `umidadetemperatura_legado/`) continuam no repositório apenas como referência histórica e não devem mais ser usados para novas gravações.
+
+> Cada sketch fica na sua própria pasta, com o `.ino` de mesmo nome — é a convenção do Arduino: um mesmo diretório com mais de um `.ino` é tratado como um único sketch e não compila.
 
 **Como funciona a identificação automática da estação:**
 No boot, o firmware tenta conectar em cada rede WiFi de uma lista conhecida, na ordem abaixo. A primeira rede que conectar define automaticamente em qual estação (aba da planilha) os dados serão gravados — não é preciso configurar nada manualmente por placa.
@@ -72,7 +74,7 @@ O dashboard mostra temperatura, umidade, estado dos dois relés, estado do LED, 
 
 ## ⏱️ Tabela de horários de irrigação
 
-Horários configurados em `horariosSetor1[]` e `horariosSetor2[]`, dentro de `automacao_sitio.ino`. Para alterar, edite esses arrays e regrave o firmware.
+Horários configurados em `horariosSetor1[]` e `horariosSetor2[]`, dentro de `automacao_sitio/automacao_sitio.ino`. Para alterar, edite esses arrays e regrave o firmware.
 
 **Setor 1 — irrigação dentro do sítio (GPIO 25):**
 
@@ -181,7 +183,7 @@ git clone https://github.com/jrmaceio/automacao_sitio.git
 
 Configurar o Ambiente:
 
-Abra `automacao_sitio.ino` na IDE do Arduino.
+Abra a pasta `automacao_sitio/` (ou o arquivo `automacao_sitio.ino` dentro dela) na IDE do Arduino.
 
 Instale as bibliotecas listadas na seção anterior.
 

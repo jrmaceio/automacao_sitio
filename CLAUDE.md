@@ -4,41 +4,53 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Visão geral do projeto
 
-Firmware para uma rede de monitoramento climático distribuído: várias placas ESP32 DOIT DEVKIT V1, cada uma conectada a um sensor de temperatura/umidade DHT22 (ou DHT11, no sketch genérico/mais antigo), que enviam leituras para uma planilha Google compartilhada via um Google Apps Script Web App funcionando como backend REST simples. Não há build system, gerenciador de pacotes ou suíte de testes — é um conjunto de sketches Arduino `.ino` independentes, feitos para serem abertos e gravados individualmente pela Arduino IDE.
+Firmware para automação de um sítio em Alagoas: uma placa ESP32 DOIT DEVKIT V1 com sensor DHT22 que monitora temperatura/umidade, controla dois relés de irrigação por tabela de horários, expõe um dashboard web local e sincroniza tudo com uma planilha Google via um Google Apps Script Web App (backend REST simples). Não há build system nem suíte de testes — é um conjunto de sketches Arduino, verificados com `arduino-cli compile` (core `esp32:esp32`, ver seção "Compilar" abaixo) e gravados pela Arduino IDE.
 
 ## Estrutura do repositório
 
-Cada arquivo `.ino` é uma **imagem de firmware completa e independente para uma estação física** — eles não se incluem/importam entre si, são cópias derivadas umas das outras:
+**Cada sketch Arduino vive na sua própria pasta, com o `.ino` tendo o mesmo nome da pasta** — convenção obrigatória do Arduino: a IDE (e o `arduino-cli`) trata todo `.ino` que estiver numa mesma pasta como parte de um único sketch, então dois sketches diferentes nunca podem compartilhar uma pasta (já causou erro de `setup()`/`loop()` duplicado quando os arquivos estavam soltos na raiz — não volte a colocá-los soltos).
 
-- `UmidTempDth22Arapiraca.ino` — estação de Arapiraca, AL (DHT22, loop com deep sleep).
-- `UmidTempDth22BeloMonte.ino` — estação de Belo Monte, AL (DHT22, loop com deep sleep). Estruturalmente idêntico ao sketch de Arapiraca, exceto pelas credenciais WiFi, a `googleScriptURL` e a string `identificacao` ("BeloMonte") passada nas chamadas de comunicação com a planilha.
-- `umidadetemperatura.ino` — versão genérica/mais antiga do mesmo firmware, usando DHT11 e um loop baseado em `delay()` em vez de deep sleep.
-- `googleplanilhas_Modelo.ino` — arquivo de referência/modelo contendo só as funções auxiliares de HTTP para a planilha Google (`escreverEmLista`, `escreverEmCelula`, `lerCelula`, `lerLinha`, `montarCabecalho`), usado como template ao configurar o sketch de uma nova estação. Não compila sozinho (sem `setup()`/`loop()`).
-- `ScriptPlanilha_GOOGLEDrive` — o Google Apps Script (JavaScript, handler `doPost`) que precisa ser implantado como Web App do lado da planilha; é para onde a `googleScriptURL` de cada sketch aponta. Inclui o passo a passo de implantação.
-- `PromptGrafico.md` — um template de prompt (em português) para gerar um dashboard climático comparativo (gráficos de linha + box plots) a partir dos dados coletados, usando uma ferramenta de BI/IA externa. Não é código.
-- O README menciona uma terceira estação, "União dos Palmares", mas ainda não existe um `.ino` correspondente no repositório.
+- **`automacao_sitio/automacao_sitio.ino`** — **firmware ativo, único, usado em todas as estações.** Ver arquitetura detalhada abaixo.
+- `UmidTempDth22Arapiraca/`, `UmidTempDth22BeloMonte/`, `umidadetemperatura_legado/`, `googleplanilhas_Modelo/` — sketches antigos, mantidos só como referência histórica; **não usar para novas gravações**. `googleplanilhas_Modelo.ino` não compila sozinho (sem `setup()`/`loop()`), é só um template de funções HTTP.
+- `ScriptPlanilha_GOOGLEDrive` — o Google Apps Script (JavaScript, handler `doPost`) que precisa ser implantado como Web App do lado da planilha; é para onde `googleScriptURL` aponta. Cria abas automaticamente se não existirem (estação nova ou a aba "Log"). **Qualquer alteração aqui exige reimplantar o Web App** (Implantar → Gerenciar implantações → editar → Nova versão) — só salvar o código não atualiza a versão publicada que o ESP32 chama.
+- `PromptGrafico.md` — template de prompt para gerar um dashboard climático comparativo (BI externo). Não é código.
+- O README menciona uma terceira estação, "União dos Palmares", ainda sem WiFi cadastrado no firmware.
 
-Não há header/biblioteca compartilhada entre os sketches das estações — a lógica comum (conexão WiFi, POST HTTP para o Apps Script, bootstrap do cabeçalho) está duplicada em cada arquivo. Ao corrigir um bug ou mudar o protocolo de comunicação, verifique se o mesmo código existe nos outros sketches de estação e também precisa da correção.
+## Compilar / verificar
 
-## Arquitetura: protocolo firmware ↔ planilha
+Não tem Arduino IDE necessariamente disponível no ambiente do Claude Code — use `arduino-cli`:
 
-Toda a comunicação é um único `HTTPClient::POST` de um corpo JSON para `googleScriptURL`, com um campo `action` selecionando o comportamento no handler `doPost` do Apps Script:
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32doit-devkit-v1 automacao_sitio
+```
 
-- `escreverEmLista` — adiciona uma linha `[timestamp, data, hora, ...dados]` na aba da planilha nomeada por `identificacao` (uma aba por estação, ex.: "Arapiraca", "BeloMonte"). `dados` é `[umidade, temperatura, statusBotao]`.
-- `escreverEmCelula` — escreve um valor único em uma célula específica (`celula`, ex.: `"G2"`).
-- `lerCelula` — lê e retorna o valor de uma célula.
-- `lerLinha` — lê uma linha inteira (usada pelo helper `lerLinha` em `googleplanilhas_Modelo.ino`; não é chamada atualmente pelos sketches de estação).
+Rode isso (ou peça pro usuário rodar na IDE) depois de qualquer mudança em `automacao_sitio/automacao_sitio.ino` — o arquivo já teve erro de compilação real (overloads ambíguos por causa da estrutura de pastas errada) que só apareceu na primeira compilação de verdade. Não assuma que compila só de ler o código.
 
-A cada iteração do loop, os sketches de estação DHT22 também **consultam a planilha de volta** para controle remoto: leem a célula `G2` (estado do relé/`RELE_PIN`), `H2` (estado do LED/`LED_PIN`) e `I2` (flag de reset remoto — escrever "1" em `I2` na planilha dispara `ESP.restart()`, e o firmware limpa a célula de volta para "0" antes disso, para evitar boot loop). `montarCabecalho()` verifica a célula `A1` contra o cabeçalho esperado no boot e (re)escreve a linha de cabeçalho a partir da coluna A caso não confira, usando o nome da aba (`identificacao`) como ID da placa.
+Bibliotecas necessárias (`arduino-cli lib install "..."` ou Gerenciador de Bibliotecas da IDE): `DHT sensor library` (Adafruit), `Adafruit Unified Sensor`, `ArduinoJson`. `WiFi.h`, `HTTPClient.h`, `WebServer.h`, `ESPmDNS.h`, `LittleFS.h`/`FS.h` já vêm no Core ESP32.
 
-Layout de pinos usado de forma consistente nos sketches DHT22: `RELE_PIN=25`, `LED_PIN=26`, `BOTAO_PIN=27` (INPUT_PULLUP, ativo em nível baixo), `DHT_PIN=4`.
+## Arquitetura de `automacao_sitio.ino`
 
-Os dois sketches de estação DHT22 dormem via `esp_deep_sleep_start()` entre ciclos (`TIME_TO_SLEEP=2400`s / 40 min) em vez de fazer loop com `delay()`; já o `umidadetemperatura.ino` (DHT11), mais antigo, faz loop infinito com `delay(INTERVALO_LOOP)` (30 min) e sem deep sleep.
+**Identificação automática da estação por WiFi:** não há mais um `.ino` por estação. No boot, `conectarWiFi()` tenta cada rede de `redesConhecidas[]` (struct `{ssid, senha, identificacao}`) em ordem; a primeira que conectar define a variável global `identificacao`, usada como nome da aba na planilha. Para adicionar uma estação nova, só adicionar uma entrada nesse array — não criar um novo `.ino`.
 
-## Trabalhando com estes arquivos
+**Sem deep sleep**, ao contrário dos sketches antigos: o loop é não bloqueante (baseado em `millis()`), porque o servidor web e o controle dos relés precisam responder a qualquer momento. Três cadências independentes, cada uma com seu próprio intervalo — **não junte tudo num só ciclo**, isso já foi pedido e recusado de propósito (ver histórico): as janelas de irrigação são de 30 min, então a verificação do relé (`INTERVALO_VERIFICA_RELE_MS`, 1s) tem que ficar independente do envio à planilha (`INTERVALO_SYNC_PLANILHA_MS`, 40 min) — senão o relé liga/desliga atrasado e passa da duração da janela.
 
-- Não há nada para build/lint/test com ferramental padrão — a verificação é "compila e sobe pela Arduino IDE" (Placa: "DOIT ESP32 DEVKIT V1") e depois ler a saída do Monitor Serial a 115200 baud.
-- Bibliotecas Arduino necessárias: `DHT sensor library` (Adafruit), `Adafruit Unified Sensor`, `ArduinoJson`, além de `WiFi.h`/`HTTPClient.h` já inclusas no Core do ESP32.
-- SSID/senha do WiFi e a URL de implantação do Google Apps Script estão hardcoded em cada arquivo como literais `const char*`/`String` perto do topo do sketch — são credenciais reais já commitadas no repositório, não placeholders. Ao editar o sketch de uma estação, preserve suas credenciais/URL existentes a menos que o usuário peça explicitamente para rotacioná-las.
-- Se for pedido para adicionar uma nova estação (ex.: a de "União dos Palmares", citada no README mas ainda ausente aqui), copie `UmidTempDth22Arapiraca.ino` ou `UmidTempDth22BeloMonte.ino` como template (não `googleplanilhas_Modelo.ino`), e atualize: `ssid`/`password`, `googleScriptURL` (se usar uma implantação/planilha diferente do Apps Script), e toda string `identificacao` passada para `escreverEmLista`/`lerCelula`/`escreverEmCelula`/`montarCabecalho`.
-- Se mudar o protocolo JSON (nomes de campos, novos valores de `action`), atualize também `ScriptPlanilha_GOOGLEDrive` (o switch do `doPost`) — firmware e Apps Script precisam concordar no formato do payload, já que não há schema/tipagem compartilhada entre eles.
+- Leitura DHT22: a cada 5s (`INTERVALO_LEITURA_DHT_MS`), alimenta o dashboard.
+- Verificação/aplicação dos relés: a cada 1s (`INTERVALO_VERIFICA_RELE_MS`), compara a hora (NTP) contra `horariosSetor1[]`/`horariosSetor2[]` (`dentroDeAlgumaFaixa`), aplicando override manual da planilha quando presente (`aplicarOverrideOuHorario` — só loga quando o estado muda).
+- Sync com a planilha: a cada 40 min (`INTERVALO_SYNC_PLANILHA_MS`), grava a leitura do sensor e lê os overrides (G2/H2/I2/J2).
+- Retry da fila local: a cada 2 min (`INTERVALO_TENTATIVA_FILA_MS`).
+
+**Colunas da planilha (aba por estação):** A-F = timestamp/data/hora/umidade/temperatura/botão (escritas automaticamente). G2 = override Setor 1 (`1`/`0`/vazio=segue horário), H2 = override LED, I2 = comando de reset remoto (firmware limpa para "0" sozinho), J2 = override Setor 2. Não mexer na ordem dessas colunas sem atualizar tanto `montarCabecalho()` quanto os índices usados em `sincronizarComPlanilha()`.
+
+**Log de eventos (aba "Log"):** toda mudança de estado de relé, toda sincronização NTP (uma vez no boot) e todo envio de sensor geram uma linha via `registrarLog()` (categoria/evento/resultado/detalhe). Isso passa pela mesma fila de resiliência abaixo.
+
+**Fila local (LittleFS):** `escreverEmLista`/`escreverLogEmLista` passam por `enviarOuEnfileirar()` — se o POST falhar, o payload JSON é gravado como uma linha em `/fila.jsonl` na flash (`enfileirar()`), e `tentarEsvaziarFila()` tenta reenviar periodicamente, sobrevivendo a reboots. Limite de 150 registros (`MAX_REGISTROS_FILA`); estoura, descarta o mais antigo. **`escreverEmCelula()` (usado só para limpar o reset e escrever cabeçalho) não passa por essa fila de propósito** — se a limpeza do reset falhar, o firmware aborta o restart em vez de enfileirar, pra não cair num boot loop.
+
+**Dashboard web local:** `WebServer` na porta 80 + `ESPmDNS` (`http://automacao-<identificacao minúsculo>.local`). Mostra leitura atual, estado dos relés/LED, fila pendente (`filaTamanho`) e os últimos eventos (ring buffer em RAM, `logRecentes[]`, não persistido).
+
+Pinos: `RELE_SETOR1_PIN=25`, `RELE_SETOR2_PIN=33` (evite pinos input-only como GPIO34-39 se adicionar mais saídas), `LED_PIN=26`, `BOTAO_PIN=27` (INPUT_PULLUP), `DHT_PIN=4`. Tabela completa com fiação em [README.md](README.md).
+
+## Coisas para não fazer de novo
+
+- Não coloque dois `.ino` de sketches diferentes na mesma pasta (ver "Compilar" acima).
+- Não faça a verificação do relé compartilhar cadência com o envio à planilha.
+- SSID/senha do WiFi e a URL do Apps Script estão hardcoded no `.ino` como credenciais reais já commitadas — preserve-as ao editar, a menos que o usuário peça pra rotacionar.
