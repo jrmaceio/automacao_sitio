@@ -22,11 +22,13 @@ function doPost(e) {
     var params = JSON.parse(e.postData.contents);
     var action = params.action;
     
-    // Abre a planilha pelo nome da aba (página)
-    // Certifique-se de que o nome "Arapiraca" corresponde exatamente ao nome da sua aba na planilha
-    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(params.identificacao);
+    // Abre a planilha pelo nome da aba (página). Se a aba ainda não existir
+    // (ex.: nova estação, ou a aba "Log" na primeira vez), cria automaticamente,
+    // para não exigir configuração manual antes de cada novo dispositivo/estação.
+    var planilha = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = planilha.getSheetByName(params.identificacao);
     if (!sheet) {
-      return ContentService.createTextOutput("ERRO: Aba da planilha não encontrada: " + params.identificacao);
+      sheet = planilha.insertSheet(params.identificacao);
     }
 
     // Executa a ação solicitada
