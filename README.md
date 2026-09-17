@@ -1,3 +1,5 @@
+# automacao_sitio
+
 Projeto de Monitoramento Climático com ESP32 Doit Devkit Esp32-wroom 32 Modulo Microcontrolador em Alagoas
 
 Frequancia: 240 MHz
@@ -67,7 +69,7 @@ Siga os passos abaixo para configurar e rodar o projeto em um novo ESP32.
 
 Clonar o Repositório:
 
-git clone https://github.com/seu-usuario/seu-repositorio.git
+git clone https://github.com/jrmaceio/automacao_sitio.git
 
 Configurar o Ambiente:
 
