@@ -63,14 +63,48 @@ O dashboard mostra temperatura, umidade, estado dos dois relés, estado do LED, 
 | Pino ESP32 (GPIO) | Função | Conectado a | Observação |
 |---|---|---|---|
 | **GPIO 4** | Dados do sensor DHT22 | Pino DATA do DHT22 | Resistor de pull-up 10kΩ entre VCC e DATA |
-| **GPIO 25** | Relé Setor 1 (irrigação dentro do sítio) | Sinal/IN do módulo relé 1 | Nível ALTO (HIGH) energiza o relé |
-| **GPIO 33** | Relé Setor 2 (irrigação atrás do salão) | Sinal/IN do módulo relé 2 | Nível ALTO (HIGH) energiza o relé |
+| **GPIO 25** | Relé Setor 1 (irrigação dentro do sítio) | Sinal/IN do módulo relé 1 | Padrão: nível ALTO (HIGH) energiza o relé — ajustável em `RELE_ATIVO_EM_LOW` (veja abaixo) |
+| **GPIO 33** | Relé Setor 2 (irrigação atrás do salão) | Sinal/IN do módulo relé 2 | Padrão: nível ALTO (HIGH) energiza o relé — ajustável em `RELE_ATIVO_EM_LOW` (veja abaixo) |
 | **GPIO 26** | LED indicativo de funcionamento | LED + resistor em série | Aceso = firmware rodando normalmente |
 | **GPIO 27** | Botão/chave manual | Botão ligado ao GND | `INPUT_PULLUP` — pressionado = nível BAIXO |
 | **3V3** | Alimentação do sensor | VCC do DHT22 | — |
 | **GND** | Referência comum (terra) | GND do DHT22, dos dois relés e do botão | — |
 
 > Dica: essa tabela pode ser copiada e impressa como etiqueta para colar dentro da caixa de cada estação, junto ao ESP32.
+
+### ⚙️ Polaridade do módulo de relé (`RELE_ATIVO_EM_LOW`)
+
+Módulos de relé de 2 canais com foto-acoplador variam entre fabricantes: alguns energizam o relé com `IN` em **HIGH**, outros com `IN` em **LOW**. O firmware assume HIGH por padrão, mas isso é configurável na constante `RELE_ATIVO_EM_LOW` no topo de `automacao_sitio/automacao_sitio.ino`:
+
+```cpp
+const bool RELE_ATIVO_EM_LOW = false; // true = seu módulo liga com IN em LOW
+```
+
+**Antes de ligar a carga real (bomba/válvula)**, grave o firmware e observe o relé no boot: com `false`, ele deve permanecer **desligado**. Se ligar sozinho, troque para `true` e regrave.
+
+### 💧 Ligação das válvulas de irrigação (24V AC, fonte única compartilhada)
+
+As válvulas solenoide de irrigação (Setor 1 e Setor 2) são acionadas por 24V AC e não têm polaridade. É possível usar **uma única fonte de 24V AC** para as duas, desde que o fio comum vá direto para as válvulas (sem passar por relé) e cada relé chaveie apenas o fio de setor da sua própria válvula:
+
+```
+Fonte 24V AC
+   ├── Terminal A (comum) ──┬──────────────► Fio "comum" da Válvula Setor 1
+   │                        └──────────────► Fio "comum" da Válvula Setor 2
+   │
+   └── Terminal B (chaveado) ──┬──► COM do Relé 1 ──► NO do Relé 1 ──► Fio "setor" da Válvula 1 (GPIO 25)
+                                └──► COM do Relé 2 ──► NO do Relé 2 ──► Fio "setor" da Válvula 2 (GPIO 33)
+```
+
+- **Terminal A** da fonte liga direto (sem relé) aos dois fios "comuns" das válvulas — pode unir os dois num único ponto/borne.
+- **Terminal B** da fonte liga aos pinos **COM** dos dois relés (em paralelo, mesma fase para os dois).
+- **NO** (normalmente aberto) de cada relé liga ao fio de setor da válvula correspondente.
+- Ao ativar um relé, o ESP32 fecha o contato COM↔NO daquele setor, completando o circuito fonte → válvula → comum → fonte, sem afetar o outro setor.
+
+**Cuidados:**
+- O módulo de relé já isola o lado 3.3V (pino `IN`/lógica) do lado 24V AC (contatos COM/NO/NC) — **nunca ligar 24V AC nos pinos de sinal do módulo ou em qualquer GPIO do ESP32**.
+- Verifique a corrente/VA de cada solenoide (tipicamente ~300–500 mA em regime, mais pico de partida) contra a capacidade da fonte, principalmente se os horários de `horariosSetor1[]`/`horariosSetor2[]` puderem se sobrepor (as duas válvulas abertas ao mesmo tempo somam corrente).
+- Considere um fusível (~1A) no fio do Terminal B, antes de dividir para os dois relés, para proteger a fonte em caso de curto numa válvula.
+- Use conectores próprios para irrigação (wire nuts com gel/silicone ou IP68), já que a fiação fica exposta à umidade da terra.
 
 ## ⏱️ Tabela de horários de irrigação
 

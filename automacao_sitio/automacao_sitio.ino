@@ -47,7 +47,7 @@ const int DHT_PIN = 4;
 // relé, HIGH desliga) — o oposto do que este firmware assume por padrão (false = ativo em HIGH).
 // Teste antes de ligar a carga real (bomba/válvula): ao gravar com "false", o relé deve
 // ficar DESLIGADO logo no boot. Se ele ligar sozinho no boot, troque para "true" abaixo.
-const bool RELE_ATIVO_EM_LOW = false;
+const bool RELE_ATIVO_EM_LOW = true;
 const int RELE_LIGADO    = RELE_ATIVO_EM_LOW ? LOW  : HIGH;
 const int RELE_DESLIGADO = RELE_ATIVO_EM_LOW ? HIGH : LOW;
 
