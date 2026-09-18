@@ -643,12 +643,12 @@ void verificarEAplicarRele() {
   String valorEfetivoSetor1 = manual1Ativo ? "1" : overrideSetor1;
   String valorEfetivoSetor2 = manual2Ativo ? "1" : overrideSetor2;
 
-  if (manual1Ativo || horaOk) {
-    aplicarOverrideOuHorario("Setor1", valorEfetivoSetor1, ligarSetor1PorHorario, RELE_SETOR1_PIN, estadoSetor1);
-  }
-  if (manual2Ativo || horaOk) {
-    aplicarOverrideOuHorario("Setor2", valorEfetivoSetor2, ligarSetor2PorHorario, RELE_SETOR2_PIN, estadoSetor2);
-  }
+  // Aplica sempre, mesmo sem NTP: ligarXPorHorario já é false quando horaOk é false,
+  // e overrides manual/planilha não dependem de NTP. Um guard "manual1Ativo || horaOk"
+  // existiu aqui e causava bug: cancelar o manual antes do primeiro sync NTP não
+  // desligava o relé (nenhum digitalWrite era emitido, pino ficava travado em LIGADO).
+  aplicarOverrideOuHorario("Setor1", valorEfetivoSetor1, ligarSetor1PorHorario, RELE_SETOR1_PIN, estadoSetor1);
+  aplicarOverrideOuHorario("Setor2", valorEfetivoSetor2, ligarSetor2PorHorario, RELE_SETOR2_PIN, estadoSetor2);
 }
 
 // ====================================================================
