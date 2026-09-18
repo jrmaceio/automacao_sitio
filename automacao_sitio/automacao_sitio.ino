@@ -42,6 +42,15 @@ const int BOTAO_PIN = 27;
 const int DHT_PIN = 4;
 #define DHT_TYPE DHT22
 
+// --- LÓGICA DO MÓDULO DE RELÉ ---
+// Módulos de 2 relés com foto-acoplador costumam ser ATIVOS EM LOW (IN em LOW liga o
+// relé, HIGH desliga) — o oposto do que este firmware assume por padrão (false = ativo em HIGH).
+// Teste antes de ligar a carga real (bomba/válvula): ao gravar com "false", o relé deve
+// ficar DESLIGADO logo no boot. Se ele ligar sozinho no boot, troque para "true" abaixo.
+const bool RELE_ATIVO_EM_LOW = false;
+const int RELE_LIGADO    = RELE_ATIVO_EM_LOW ? LOW  : HIGH;
+const int RELE_DESLIGADO = RELE_ATIVO_EM_LOW ? HIGH : LOW;
+
 DHT dht(DHT_PIN, DHT_TYPE);
 WebServer server(80);
 
@@ -455,7 +464,7 @@ void aplicarOverrideOuHorario(const String& nomeRele, const String& valorOverrid
   if (ligar != estadoAtual) {
     registrarLog("Rele", nomeRele, ligar ? "LIGADO" : "DESLIGADO", "");
   }
-  digitalWrite(pino, ligar ? HIGH : LOW);
+  digitalWrite(pino, ligar ? RELE_LIGADO : RELE_DESLIGADO);
   estadoAtual = ligar;
 }
 
@@ -545,8 +554,8 @@ void setup() {
   pinMode(RELE_SETOR2_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(BOTAO_PIN, INPUT_PULLUP);
-  digitalWrite(RELE_SETOR1_PIN, LOW);
-  digitalWrite(RELE_SETOR2_PIN, LOW);
+  digitalWrite(RELE_SETOR1_PIN, RELE_DESLIGADO);
+  digitalWrite(RELE_SETOR2_PIN, RELE_DESLIGADO);
   digitalWrite(LED_PIN, LOW);
 
   dht.begin();
