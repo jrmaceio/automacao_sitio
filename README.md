@@ -41,7 +41,8 @@ No boot, o firmware tenta conectar em cada rede WiFi de uma lista conhecida, na 
 - Envio periódico dos dados para a planilha Google a cada **40 min** (mesmo intervalo do projeto original, agora sem deep sleep).
 - Servidor web local com dashboard de leitura (veja seção abaixo).
 - Sincronização de horário via NTP.
-- Controle de **dois relés de irrigação** por tabela de horários, verificado a cada 1s (independente do envio à planilha, para respeitar com precisão as janelas de 30 min), com possibilidade de override manual pela planilha.
+- Controle de **dois relés de irrigação** por tabela de horários, verificado a cada 1s (independente do envio à planilha, para respeitar com precisão as janelas de 30 min), com override permanente pela planilha e **controle manual temporizado** (ligar por N minutos) tanto pelo dashboard local quanto remotamente pela planilha, de qualquer lugar.
+- Recuperação automática de falhas: reinício detectado e registrado no log (útil pra saber se voltou de uma falta de energia), e reinício automático se o WiFi ficar caído por mais de 5 minutos.
 - **Log de eventos** (relé ligado/desligado, sucesso/falha da sincronização NTP, sucesso/falha ao gravar temperatura/umidade) registrado numa aba própria ("Log") da planilha.
 - **Fila local em flash (LittleFS)**: se a planilha não puder ser gravada no momento (sem WiFi, Apps Script fora do ar, etc.), o registro fica guardado no próprio ESP32 e é reenviado automaticamente assim que possível — sobrevive até a reinicializações.
 - Sem deep sleep: o ESP32 fica sempre ligado e conectado, para o dashboard e os relés funcionarem a qualquer momento.
@@ -142,12 +143,19 @@ O horário é sincronizado por NTP (fuso de Brasília, UTC-3, sem horário de ve
 | D | Umidade (%) | ESP32, a cada envio |
 | E | Temperatura (°C) | ESP32, a cada envio |
 | F | Estado do botão físico | ESP32, a cada envio |
-| G2 | Override manual do Relé Setor 1 (`1`=força ligado, `0`=força desligado, vazio=segue tabela de horários) | Você, na planilha |
+| G2 | Override **permanente** do Relé Setor 1 (`1`=força ligado, `0`=força desligado, vazio=segue tabela de horários) — fica valendo até você mudar de novo | Você, na planilha |
 | H2 | Override manual do LED (`1`/`0`) | Você, na planilha |
 | I2 | Comando de reset remoto (`1`=reinicia o ESP32; o firmware limpa de volta para `0` automaticamente) | Você, na planilha |
-| J2 | Override manual do Relé Setor 2 (`1`/`0`/vazio=segue tabela de horários) | Você, na planilha |
+| J2 | Override **permanente** do Relé Setor 2 (`1`/`0`/vazio=segue tabela de horários) | Você, na planilha |
+| K2 | **Ligar o Setor 1 remotamente por N minutos**: escreva um número (ex. `20`) e o relé liga por N minutos, mesmo de longe (outra cidade); depois volta sozinho ao automático. O firmware limpa a célula de volta pra vazio depois de aplicar. | Você, na planilha |
+| L2 | Igual ao K2, mas para o Setor 2 | Você, na planilha |
+| M2 | **Status atual** (somente leitura, atualizado a cada ~2 min): mostra o estado de cada relé, se está seguindo horário/override/manual, quanto tempo falta pro manual expirar, estado do LED e fila pendente — tudo o que está valendo agora, num relance, sem precisar abrir o log | ESP32, a cada ~2 min |
 
-O cabeçalho (linha 1) é escrito automaticamente pelo firmware no primeiro boot, caso ainda não esteja configurado na aba. Se a aba de uma estação (ou a aba "Log") ainda não existir na planilha, o Apps Script cria automaticamente na primeira gravação — não precisa criar manualmente.
+G2/H2/J2 (override permanente) e K2/L2 (ligar temporário) podem ser usados juntos: K2/L2 tem prioridade enquanto o cronômetro não expira; depois disso, volta a valer o override permanente de G2/J2 (ou a tabela de horários, se estiverem vazios).
+
+Essas mesmas colunas (K2/L2/M2) também podem ser controladas/consultadas pelo dashboard web local (`http://automacao-<estação>.local`), que tem botões prontos para ligar cada setor por 15min/30min/1h/2h — útil quando você está na rede do sítio; a planilha é o caminho para controlar de fora, de qualquer lugar.
+
+O cabeçalho (linha 1) é escrito automaticamente pelo firmware no primeiro boot, caso ainda não esteja configurado na aba (ele confere a última coluna do cabeçalho, então uma aba já em uso ganha as colunas novas automaticamente no boot seguinte a uma atualização do firmware). Se a aba de uma estação (ou a aba "Log") ainda não existir na planilha, o Apps Script cria automaticamente na primeira gravação — não precisa criar manualmente.
 
 ## 📝 Log de eventos (aba "Log")
 
@@ -159,15 +167,17 @@ Toda vez que algo relevante acontece, o firmware grava uma linha na aba **"Log"*
 | B | Data |
 | C | Hora |
 | D | Estação (Arapiraca / BeloMonte) |
-| E | Categoria (`Sensor`, `Rele`, `NTP`) |
-| F | Evento (ex.: `leitura_temp_umidade`, `Setor1`, `Setor2`, `sincronizacao_hora`) |
-| G | Resultado (`SUCESSO`, `FALHA`, `FALHA_ENFILEIRADO`, `LIGADO`, `DESLIGADO`) |
-| H | Detalhe (texto livre, ex. motivo da falha) |
+| E | Categoria (`Sensor`, `Rele`, `NTP`, `Sistema`, `WiFi`) |
+| F | Evento (ex.: `leitura_temp_umidade`, `Setor1`, `Setor2`, `sincronizacao_hora`, `boot`, `conexao`) |
+| G | Resultado (`SUCESSO`, `FALHA`, `FALHA_ENFILEIRADO`, `LIGADO`, `DESLIGADO`, `MANUAL_LIGADO`, `MANUAL_CANCELADO`, `MANUAL_EXPIRADO`, `RECUPERADO`, `REINICIADO`) |
+| H | Detalhe (texto livre, ex. motivo da falha, motivo do reinício, "via planilha, remoto") |
 
 O que é registrado:
 - **Sensor** — a cada envio periódico (40 min): se a leitura de temperatura/umidade foi gravada com sucesso, ficou pendente na fila local (`FALHA_ENFILEIRADO`), ou falhou porque o sensor não retornou leitura válida (`FALHA`).
-- **Rele** — toda vez que o Setor 1 ou o Setor 2 liga ou desliga (por horário ou por override manual).
+- **Rele** — toda vez que o Setor 1 ou o Setor 2 liga ou desliga, seja por horário, override da planilha (G2/J2) ou override manual temporizado (dashboard local ou comando remoto K2/L2 — `MANUAL_LIGADO`/`MANUAL_CANCELADO`/`MANUAL_EXPIRADO`).
 - **NTP** — uma vez no boot, se a hora foi sincronizada com sucesso ou não.
+- **Sistema** — uma vez a cada boot (`boot`), com o motivo do reinício (energização, queda de tensão/brownout, reset por software, watchdog, etc.); motivos de energização/brownout aparecem como `RECUPERADO`, indicando provável recuperação de uma falta de energia — os demais como `REINICIADO`.
+- **WiFi** — quando a conexão cai em runtime, quando reconecta sozinha, e se ficar sem conexão por 5+ minutos e o firmware reiniciar por causa disso.
 
 ## 📦 Fila local (funciona mesmo sem planilha)
 

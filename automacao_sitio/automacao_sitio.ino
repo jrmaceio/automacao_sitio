@@ -7,6 +7,7 @@
 #include <vector>
 #include <FS.h>
 #include <LittleFS.h>
+#include <esp_system.h>
 
 // Inclusão da biblioteca para o sensor DHT
 #include "DHT.h"
@@ -43,11 +44,12 @@ const int DHT_PIN = 4;
 #define DHT_TYPE DHT22
 
 // --- LÓGICA DO MÓDULO DE RELÉ ---
-// Módulos de 2 relés com foto-acoplador costumam ser ATIVOS EM LOW (IN em LOW liga o
-// relé, HIGH desliga) — o oposto do que este firmware assume por padrão (false = ativo em HIGH).
-// Teste antes de ligar a carga real (bomba/válvula): ao gravar com "false", o relé deve
-// ficar DESLIGADO logo no boot. Se ele ligar sozinho no boot, troque para "true" abaixo.
-const bool RELE_ATIVO_EM_LOW = true;
+// Ajustável conforme o módulo físico: alguns energizam o relé com IN em HIGH,
+// outros com IN em LOW. Teste antes de ligar a carga real (bomba/válvula): ao gravar,
+// o relé deve ficar DESLIGADO logo no boot, e LIGAR quando o comando de ligar chega
+// (pelo horário, override da planilha ou controle manual). Se estiver ao contrário
+// (liga sozinho no boot / desliga quando devia ligar), inverta o valor abaixo.
+const bool RELE_ATIVO_EM_LOW = false;
 const int RELE_LIGADO    = RELE_ATIVO_EM_LOW ? LOW  : HIGH;
 const int RELE_DESLIGADO = RELE_ATIVO_EM_LOW ? HIGH : LOW;
 
@@ -103,6 +105,13 @@ String overrideSetor1 = "";
 String overrideSetor2 = "";
 String overrideLed = "";
 
+// Override manual temporizado, acionado pelo dashboard local (independe da planilha
+// e do NTP): 0 = nenhum override ativo; caso contrário, millis() em que expira e o
+// relé volta a seguir a planilha/tabela de horários automaticamente.
+unsigned long manualSetor1AteMs = 0;
+unsigned long manualSetor2AteMs = 0;
+const int MANUAL_MINUTOS_MAXIMO = 180; // limite de segurança: no máx. 3h de override manual
+
 // ====================================================================
 // FILA LOCAL (LittleFS) — registros que falharam ao enviar para a planilha
 // ficam guardados na flash do ESP32 e são reenviados assim que possível,
@@ -130,11 +139,23 @@ const unsigned long INTERVALO_SYNC_PLANILHA_MS = 2400000;  // 40 min
 // Tentativa de reenviar a fila local com mais frequência, para não esperar 40 min
 // depois que a rede/planilha voltar a funcionar.
 const unsigned long INTERVALO_TENTATIVA_FILA_MS = 120000;  // 2 min
+// Verifica se o WiFi ainda está conectado a cada 30s; se ficar caído por tempo
+// demais (falta de energia no roteador, etc.) e não conseguir reconectar sozinho,
+// reinicia o ESP32 — mais confiável do que tentar recuperar a pilha WiFi em runtime.
+const unsigned long INTERVALO_VERIFICA_WIFI_MS = 30000;       // 30s
+const unsigned long LIMITE_WIFI_SEM_CONEXAO_MS = 5UL * 60000UL; // 5 min
+// Overrides/comandos remotos (G2/H2/I2/J2/K2/L2) e status (M2) são lidos/escritos numa
+// cadência própria, bem mais curta que o envio do sensor (40 min) — senão ligar pela
+// planilha de outra cidade poderia demorar até 40 min pra fazer efeito.
+const unsigned long INTERVALO_LEITURA_COMANDOS_MS = 120000;   // 2 min
 
 unsigned long ultimaLeituraDht = 0;
 unsigned long ultimaVerificacaoRele = 0;
 unsigned long ultimoSyncPlanilha = 0;
 unsigned long ultimaTentativaFila = 0;
+unsigned long ultimaVerificacaoWifi = 0;
+unsigned long ultimaLeituraComandos = 0;
+unsigned long wifiCaidoDesdeMs = 0; // 0 = conectado (ou queda ainda não detectada)
 
 // ====================================================================
 // WIFI
@@ -164,6 +185,39 @@ bool conectarWiFi() {
     delay(500);
   }
   return false;
+}
+
+// Chamada periodicamente no loop(). Detecta queda de WiFi em runtime (ex.: falta de
+// energia no roteador), tenta reconectar sozinho e, se não conseguir dentro de
+// LIMITE_WIFI_SEM_CONEXAO_MS, reinicia o ESP32 — o evento fica registrado no log
+// (na fila local, já que sem WiFi não há como enviar na hora) tanto na queda quanto
+// na recuperação/reinício.
+void verificarConexaoWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (wifiCaidoDesdeMs != 0) {
+      registrarLog("WiFi", "conexao", "RECUPERADO", "Reconectado apos queda");
+      wifiCaidoDesdeMs = 0;
+    }
+    return;
+  }
+
+  unsigned long agoraMs = millis();
+  if (wifiCaidoDesdeMs == 0) {
+    wifiCaidoDesdeMs = agoraMs;
+    Serial.println("WIFI: Conexão perdida. Tentando reconectar...");
+    registrarLog("WiFi", "conexao", "FALHA", "Conexao perdida, tentando reconectar");
+    WiFi.reconnect();
+    return;
+  }
+
+  if (agoraMs - wifiCaidoDesdeMs >= LIMITE_WIFI_SEM_CONEXAO_MS) {
+    Serial.println("WIFI: Sem conexão há 5+ min. Reiniciando...");
+    registrarLog("WiFi", "conexao", "FALHA", "Sem conexao ha 5+ min; reiniciando o ESP32");
+    delay(500);
+    ESP.restart();
+  } else {
+    WiFi.reconnect();
+  }
 }
 
 // ====================================================================
@@ -352,10 +406,14 @@ bool escreverEmCelula(const String& identificacaoEstacao, const String& celula, 
   return !response.startsWith("ERRO");
 }
 
+// Verifica a ÚLTIMA célula do cabeçalho (não só a primeira): assim, se novas colunas
+// forem adicionadas a `cabecalhos` num sketch novo, uma planilha já em uso (que já tem
+// A1 preenchido de antes) ainda recebe as colunas novas em vez de ficar sem cabeçalho nelas.
 void montarCabecalho(const String& boardID, const String& colunaInicial, const std::vector<String>& cabecalhos) {
-  String celulaVerificacao = lerCelula(boardID, colunaInicial + "1");
-  if (celulaVerificacao != cabecalhos[0]) {
-    Serial.println("Cabeçalho não encontrado. Configurando a planilha...");
+  char colunaFinal = colunaInicial[0] + (cabecalhos.size() - 1);
+  String celulaVerificacao = lerCelula(boardID, String(colunaFinal) + "1");
+  if (celulaVerificacao != cabecalhos[cabecalhos.size() - 1]) {
+    Serial.println("Cabeçalho incompleto/desatualizado. Configurando a planilha...");
     char coluna = colunaInicial[0];
     for (size_t i = 0; i < cabecalhos.size(); i++) {
       String celulaAlvo = String(coluna) + "1";
@@ -383,7 +441,10 @@ void registrarLog(const String& categoria, const String& evento, const String& r
     snprintf(horaTexto, sizeof(horaTexto), "%02d:%02d:%02d", horaAtual.tm_hour, horaAtual.tm_min, horaAtual.tm_sec);
   }
 
-  std::vector<String> valores = {identificacao, categoria, evento, resultado, detalhe};
+  // Antes do WiFi conectar a identificação da estação ainda não é conhecida;
+  // usa um rótulo fixo em vez de deixar a coluna vazia na aba "Log".
+  String estacaoLog = identificacao.length() > 0 ? identificacao : "Desconhecida";
+  std::vector<String> valores = {estacaoLog, categoria, evento, resultado, detalhe};
   escreverLogEmLista(valores);
 
   String linhaRam = "[" + String(horaTexto) + "] " + categoria + "/" + evento + " -> " + resultado;
@@ -392,8 +453,9 @@ void registrarLog(const String& categoria, const String& evento, const String& r
   Serial.println("LOG: " + linhaRam);
 }
 
-// G2 = override Setor 1 | H2 = override LED | I2 = reset | J2 = override Setor 2
-// (mesmas colunas G/H/I já usadas nas planilhas existentes; J2 é nova)
+// Envia a leitura do sensor + botão para a planilha. Overrides/comandos remotos e o
+// status atual são tratados à parte, em lerComandosDaPlanilha() (cadência própria,
+// bem mais frequente — ver comentário lá) para não depender do ciclo de 40 min daqui.
 void sincronizarComPlanilha() {
   bool statusBotao = (digitalRead(BOTAO_PIN) == LOW);
 
@@ -404,11 +466,80 @@ void sincronizarComPlanilha() {
   } else {
     registrarLog("Sensor", "leitura_temp_umidade", "FALHA", "Sensor DHT22 sem leitura valida");
   }
+}
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("PLANILHA: Sem WiFi, dados enfileirados localmente; pulando leitura de overrides.");
+// Lê a célula de comando remoto (K2/L2 = "ligar Setor N por X minutos"), aplica e limpa
+// a célula de volta pra "" — só depois de limpar com sucesso é que o override é ativado,
+// pra não reiniciar o cronômetro a cada ciclo caso a limpeza falhe e o valor continue lá.
+void lerComandoManualRemoto(const String& nomeRele, const String& celula, unsigned long &manualAteMs) {
+  String comando = lerCelula(identificacao, celula);
+  comando.trim();
+  if (comando.length() == 0) return;
+
+  int minutos = comando.toInt();
+  if (minutos <= 0) {
+    escreverEmCelula(identificacao, celula, ""); // valor inválido/lixo: limpa e ignora
     return;
   }
+
+  if (escreverEmCelula(identificacao, celula, "")) {
+    iniciarOverrideManual(nomeRele, manualAteMs, minutos);
+    registrarLog("Rele", nomeRele, "MANUAL_LIGADO", String(minutos) + " min (via planilha, remoto)");
+  } else {
+    Serial.println("PLANILHA: Falha ao limpar comando remoto de " + nomeRele + "; tenta de novo no proximo ciclo.");
+  }
+}
+
+// "HORARIO" = seguindo a tabela | "PLANILHA" = override permanente G2/J2 | "MANUAL" = override
+// temporizado ativo (dashboard local ou comando remoto K2/L2 — ambos usam o mesmo mecanismo).
+String origemAplicada(bool manualAtivo, const String& overrideValor) {
+  if (manualAtivo) return "MANUAL";
+  if (overrideValor == "1" || overrideValor == "0") return "PLANILHA";
+  return "HORARIO";
+}
+
+// Escreve um resumo do estado atual (relés, LED, overrides ativos, fila pendente) numa
+// única célula (M2), pra dar pra entender tudo que está valendo agora só de olhar a
+// planilha — sem precisar rolar o log. Complementa o log, não substitui: o log mostra o
+// histórico de mudanças, o M2 mostra a "foto" do momento.
+void atualizarStatusNaPlanilha() {
+  struct tm horaAtual;
+  char horaTexto[9] = "--:--:--";
+  if (obterHoraAtual(horaAtual)) {
+    snprintf(horaTexto, sizeof(horaTexto), "%02d:%02d:%02d", horaAtual.tm_hour, horaAtual.tm_min, horaAtual.tm_sec);
+  }
+
+  unsigned long agoraMs = millis();
+  long restante1Min = 0;
+  if (manualSetor1AteMs != 0) {
+    long diffMs = (long)(manualSetor1AteMs - agoraMs);
+    restante1Min = diffMs > 0 ? diffMs / 60000 : 0;
+  }
+  long restante2Min = 0;
+  if (manualSetor2AteMs != 0) {
+    long diffMs = (long)(manualSetor2AteMs - agoraMs);
+    restante2Min = diffMs > 0 ? diffMs / 60000 : 0;
+  }
+
+  String status = "Setor1=" + String(estadoSetor1 ? "LIGADO" : "DESLIGADO");
+  status += ";Origem1=" + origemAplicada(manualSetor1AteMs != 0, overrideSetor1);
+  status += ";ManualRestanteMin1=" + String(restante1Min);
+  status += ";Setor2=" + String(estadoSetor2 ? "LIGADO" : "DESLIGADO");
+  status += ";Origem2=" + origemAplicada(manualSetor2AteMs != 0, overrideSetor2);
+  status += ";ManualRestanteMin2=" + String(restante2Min);
+  status += ";LED=" + String(estadoLed ? "LIGADO" : "DESLIGADO");
+  status += ";FilaPendente=" + String(filaTamanho);
+  status += ";Atualizado=" + String(horaTexto);
+
+  escreverEmCelula(identificacao, "M2", status);
+}
+
+// G2 = override Setor 1 | H2 = override LED | I2 = reset | J2 = override Setor 2 |
+// K2 = ligar Setor 1 remoto (minutos) | L2 = ligar Setor 2 remoto (minutos) | M2 = status atual.
+// Roda a cada INTERVALO_LEITURA_COMANDOS_MS (2 min, independente do envio do sensor a cada
+// 40 min) para que ligar remotamente pela planilha — de outra cidade — tenha efeito em minutos.
+void lerComandosDaPlanilha() {
+  if (WiFi.status() != WL_CONNECTED) return;
 
   overrideSetor1 = lerCelula(identificacao, "G2");
   overrideLed = lerCelula(identificacao, "H2");
@@ -434,6 +565,12 @@ void sincronizarComPlanilha() {
       Serial.println("PLANILHA: Falha ao limpar célula de reset. Reset abortado.");
     }
   }
+
+  lerComandoManualRemoto("Setor1", "K2", manualSetor1AteMs);
+  lerComandoManualRemoto("Setor2", "L2", manualSetor2AteMs);
+
+  verificarEAplicarRele(); // aplica overrides/comandos na hora, sem esperar o próximo ciclo de 1s
+  atualizarStatusNaPlanilha();
 }
 
 // ====================================================================
@@ -468,20 +605,86 @@ void aplicarOverrideOuHorario(const String& nomeRele, const String& valorOverrid
   estadoAtual = ligar;
 }
 
-void verificarEAplicarRele() {
-  struct tm horaAtual;
-  if (!obterHoraAtual(horaAtual)) {
-    return; // hora ainda não sincronizada; mantém último estado
+// Liga (minutos > 0) ou cancela (minutos <= 0) o override manual temporizado de um setor.
+void iniciarOverrideManual(const String& nomeRele, unsigned long &manualAteMs, int minutos) {
+  if (minutos <= 0) {
+    if (manualAteMs != 0) {
+      manualAteMs = 0;
+      registrarLog("Rele", nomeRele, "MANUAL_CANCELADO", "Retornando ao modo automatico");
+    }
+    return;
   }
-  bool ligarSetor1 = dentroDeAlgumaFaixa(horaAtual, horariosSetor1, NUM_HORARIOS_SETOR1);
-  bool ligarSetor2 = dentroDeAlgumaFaixa(horaAtual, horariosSetor2, NUM_HORARIOS_SETOR2);
-  aplicarOverrideOuHorario("Setor1", overrideSetor1, ligarSetor1, RELE_SETOR1_PIN, estadoSetor1);
-  aplicarOverrideOuHorario("Setor2", overrideSetor2, ligarSetor2, RELE_SETOR2_PIN, estadoSetor2);
+  if (minutos > MANUAL_MINUTOS_MAXIMO) minutos = MANUAL_MINUTOS_MAXIMO;
+  manualAteMs = millis() + (unsigned long)minutos * 60000UL;
+  registrarLog("Rele", nomeRele, "MANUAL_LIGADO", String(minutos) + " min");
+}
+
+// Expira overrides manuais vencidos (chamado a cada ciclo de verificação do relé).
+void expirarOverrideManualSeVencido(const String& nomeRele, unsigned long &manualAteMs) {
+  if (manualAteMs != 0 && (long)(millis() - manualAteMs) >= 0) {
+    manualAteMs = 0;
+    registrarLog("Rele", nomeRele, "MANUAL_EXPIRADO", "Retornando ao modo automatico");
+  }
+}
+
+void verificarEAplicarRele() {
+  expirarOverrideManualSeVencido("Setor1", manualSetor1AteMs);
+  expirarOverrideManualSeVencido("Setor2", manualSetor2AteMs);
+
+  struct tm horaAtual;
+  bool horaOk = obterHoraAtual(horaAtual);
+  bool ligarSetor1PorHorario = horaOk && dentroDeAlgumaFaixa(horaAtual, horariosSetor1, NUM_HORARIOS_SETOR1);
+  bool ligarSetor2PorHorario = horaOk && dentroDeAlgumaFaixa(horaAtual, horariosSetor2, NUM_HORARIOS_SETOR2);
+
+  // O override manual do dashboard tem prioridade sobre a planilha/horário e funciona
+  // mesmo sem hora sincronizada (não depende de NTP); fora dele, segue a lógica normal.
+  bool manual1Ativo = manualSetor1AteMs != 0;
+  bool manual2Ativo = manualSetor2AteMs != 0;
+  String valorEfetivoSetor1 = manual1Ativo ? "1" : overrideSetor1;
+  String valorEfetivoSetor2 = manual2Ativo ? "1" : overrideSetor2;
+
+  if (manual1Ativo || horaOk) {
+    aplicarOverrideOuHorario("Setor1", valorEfetivoSetor1, ligarSetor1PorHorario, RELE_SETOR1_PIN, estadoSetor1);
+  }
+  if (manual2Ativo || horaOk) {
+    aplicarOverrideOuHorario("Setor2", valorEfetivoSetor2, ligarSetor2PorHorario, RELE_SETOR2_PIN, estadoSetor2);
+  }
 }
 
 // ====================================================================
 // SERVIDOR WEB / DASHBOARD
 // ====================================================================
+// Monta o card de controle manual de um setor (formulário para ligar por N minutos
+// e botão para cancelar um override manual em andamento).
+String montarCardManual(int setor, unsigned long manualAteMs, bool estadoAtual) {
+  String s = String(setor);
+  String html = "<div class='card'>";
+  html += "<div class='rotulo'>Setor " + s + " &middot; <span class='" + String(estadoAtual ? "on" : "off") + "'>" + String(estadoAtual ? "LIGADO" : "DESLIGADO") + "</span></div>";
+  if (manualAteMs != 0) {
+    long segundosRestantes = (long)(manualAteMs - millis()) / 1000;
+    if (segundosRestantes < 0) segundosRestantes = 0;
+    html += "<div class='aviso'>Manual ativo &mdash; falta" + String(segundosRestantes == 1 ? "" : "m") + " " + String(segundosRestantes / 60) + " min " + String(segundosRestantes % 60) + "s</div>";
+    html += "<form method='GET' action='/manual'>";
+    html += "<input type='hidden' name='setor' value='" + s + "'>";
+    html += "<input type='hidden' name='minutos' value='0'>";
+    html += "<button type='submit' class='cancelar'>Cancelar manual</button>";
+    html += "</form>";
+  } else {
+    html += "<form method='GET' action='/manual'>";
+    html += "<input type='hidden' name='setor' value='" + s + "'>";
+    html += "<select name='minutos'>";
+    html += "<option value='15'>15 min</option>";
+    html += "<option value='30'>30 min</option>";
+    html += "<option value='60'>1 h</option>";
+    html += "<option value='120'>2 h</option>";
+    html += "</select>";
+    html += "<button type='submit'>Ligar manual</button>";
+    html += "</form>";
+  }
+  html += "</div>";
+  return html;
+}
+
 String montarPaginaDashboard() {
   struct tm horaAtual;
   bool temHora = obterHoraAtual(horaAtual);
@@ -509,6 +712,13 @@ String montarPaginaDashboard() {
   html += ".fila{color:" + String(filaTamanho > 0 ? "#a33" : "#1a7a1a") + ";}";
   html += "ul.eventos{list-style:none;padding:0;margin:8px 0 0 0;}";
   html += "ul.eventos li{background:#fff;border-radius:6px;padding:8px 12px;margin-bottom:6px;font-size:0.85rem;box-shadow:0 1px 3px rgba(0,0,0,0.08);}";
+  html += ".manual{display:flex;flex-wrap:wrap;gap:16px;margin-top:8px;}";
+  html += ".manual .card form{display:inline-flex;gap:6px;align-items:center;margin-top:8px;}";
+  html += ".manual .card{min-width:220px;}";
+  html += ".manual select,.manual button{font-size:0.85rem;padding:4px 8px;}";
+  html += ".manual button{border:none;border-radius:5px;background:#1a7a1a;color:#fff;cursor:pointer;}";
+  html += ".manual button.cancelar{background:#a33;}";
+  html += ".manual .aviso{color:#a33;font-size:0.8rem;margin-top:4px;}";
   html += "</style></head><body>";
   html += "<h1>Estação " + identificacao + "</h1>";
   html += "<div class='sub'>IP local: " + WiFi.localIP().toString() + " &middot; Hora: " + String(horaTexto) + "</div>";
@@ -519,6 +729,11 @@ String montarPaginaDashboard() {
   html += "<div class='card'><div class='valor " + String(estadoSetor2 ? "on" : "off") + "'>" + String(estadoSetor2 ? "LIGADO" : "DESLIGADO") + "</div><div class='rotulo'>Irrigação Setor 2</div></div>";
   html += "<div class='card'><div class='valor " + String(estadoLed ? "on" : "off") + "'>" + String(estadoLed ? "LIGADO" : "DESLIGADO") + "</div><div class='rotulo'>LED</div></div>";
   html += "<div class='card'><div class='valor fila'>" + String(filaTamanho) + "</div><div class='rotulo'>Pendentes p/ sincronizar</div></div>";
+  html += "</div>";
+  html += "<h2 style='margin-top:28px;font-size:1.05rem;'>Controle manual</h2>";
+  html += "<div class='manual'>";
+  html += montarCardManual(1, manualSetor1AteMs, estadoSetor1);
+  html += montarCardManual(2, manualSetor2AteMs, estadoSetor2);
   html += "</div>";
   html += "<h2 style='margin-top:28px;font-size:1.05rem;'>Eventos recentes</h2>";
   html += "<ul class='eventos'>";
@@ -542,6 +757,51 @@ void tratarRequisicaoRaiz() {
   server.send(200, "text/html; charset=UTF-8", montarPaginaDashboard());
 }
 
+// GET /manual?setor=1|2&minutos=N — liga o setor manualmente por N minutos
+// (minutos=0 cancela o override e devolve o controle ao horário/planilha).
+void tratarRequisicaoManual() {
+  if (!server.hasArg("setor") || !server.hasArg("minutos")) {
+    server.send(400, "text/plain; charset=UTF-8", "Parametros invalidos. Use /manual?setor=1&minutos=15");
+    return;
+  }
+  int setor = server.arg("setor").toInt();
+  int minutos = server.arg("minutos").toInt();
+  if (minutos < 0) minutos = 0;
+
+  if (setor == 1) {
+    iniciarOverrideManual("Setor1", manualSetor1AteMs, minutos);
+  } else if (setor == 2) {
+    iniciarOverrideManual("Setor2", manualSetor2AteMs, minutos);
+  } else {
+    server.send(400, "text/plain; charset=UTF-8", "Setor invalido. Use 1 ou 2.");
+    return;
+  }
+
+  verificarEAplicarRele(); // aplica na hora, sem esperar o próximo ciclo de 1s
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ====================================================================
+// MOTIVO DO REINÍCIO (detecta recuperação de falta de energia, brownout, etc.)
+// ====================================================================
+String motivoReset(esp_reset_reason_t motivo, bool &pareceRecuperacaoDeFalta) {
+  pareceRecuperacaoDeFalta = (motivo == ESP_RST_POWERON || motivo == ESP_RST_BROWNOUT);
+  switch (motivo) {
+    case ESP_RST_POWERON:   return "Energizado (liga da fonte) - provavel recuperacao apos falta de energia";
+    case ESP_RST_BROWNOUT:  return "Queda de tensao (brownout) - provavel falta de energia momentanea";
+    case ESP_RST_EXT:       return "Reset externo (botao/pino EN)";
+    case ESP_RST_SW:        return "Reset por software (ESP.restart() do proprio firmware)";
+    case ESP_RST_PANIC:     return "Reset por panico/excecao no firmware";
+    case ESP_RST_INT_WDT:   return "Reset por watchdog interno";
+    case ESP_RST_TASK_WDT:  return "Reset por watchdog de tarefa (loop travado)";
+    case ESP_RST_WDT:       return "Reset por outro watchdog";
+    case ESP_RST_DEEPSLEEP: return "Retorno de deep sleep";
+    case ESP_RST_SDIO:      return "Reset via SDIO";
+    default:                return "Motivo desconhecido";
+  }
+}
+
 // ====================================================================
 // SETUP
 // ====================================================================
@@ -549,6 +809,8 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n--- INICIANDO SETUP ---");
+
+  esp_reset_reason_t razaoReset = esp_reset_reason();
 
   pinMode(RELE_SETOR1_PIN, OUTPUT);
   pinMode(RELE_SETOR2_PIN, OUTPUT);
@@ -570,9 +832,16 @@ void setup() {
 
   if (!conectarWiFi()) {
     Serial.println("WIFI: Não foi possível conectar em nenhuma rede conhecida. Reiniciando em 10s...");
+    // Sem identificação e sem WiFi ainda: fica só na fila local, enviado após um boot que conecte.
+    registrarLog("WiFi", "conexao", "FALHA", "Nenhuma rede conhecida disponivel; reiniciando");
     delay(10000);
     ESP.restart();
   }
+
+  bool pareceRecuperacaoDeFalta = false;
+  String detalheReset = motivoReset(razaoReset, pareceRecuperacaoDeFalta);
+  Serial.println("BOOT: " + detalheReset);
+  registrarLog("Sistema", "boot", pareceRecuperacaoDeFalta ? "RECUPERADO" : "REINICIADO", detalheReset);
 
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
   struct tm horaTeste;
@@ -584,7 +853,7 @@ void setup() {
   }
   registrarLog("NTP", "sincronizacao_hora", horaSincronizada ? "SUCESSO" : "FALHA", "");
 
-  montarCabecalho(identificacao, "A", {"Data completa", "Data", "Hora", "Umidade", "Temperatura", "Botao", "Rele_Setor1_Planilha", "Led_Planilha", "Reset", "Rele_Setor2_Planilha"});
+  montarCabecalho(identificacao, "A", {"Data completa", "Data", "Hora", "Umidade", "Temperatura", "Botao", "Rele_Setor1_Planilha", "Led_Planilha", "Reset", "Rele_Setor2_Planilha", "Ligar_Setor1_Min", "Ligar_Setor2_Min", "Status_Atual"});
   montarCabecalho("Log", "A", {"Data completa", "Data", "Hora", "Estacao", "Categoria", "Evento", "Resultado", "Detalhe"});
 
   String nomeMDNS = "automacao-" + identificacao;
@@ -594,6 +863,7 @@ void setup() {
   }
 
   server.on("/", tratarRequisicaoRaiz);
+  server.on("/manual", tratarRequisicaoManual);
   server.begin();
   Serial.println("WEB: Servidor iniciado na porta 80.");
 
@@ -635,5 +905,15 @@ void loop() {
   if (agoraMs - ultimaTentativaFila >= INTERVALO_TENTATIVA_FILA_MS) {
     ultimaTentativaFila = agoraMs;
     tentarEsvaziarFila();
+  }
+
+  if (agoraMs - ultimaVerificacaoWifi >= INTERVALO_VERIFICA_WIFI_MS) {
+    ultimaVerificacaoWifi = agoraMs;
+    verificarConexaoWifi();
+  }
+
+  if (ultimaLeituraComandos == 0 || agoraMs - ultimaLeituraComandos >= INTERVALO_LEITURA_COMANDOS_MS) {
+    ultimaLeituraComandos = agoraMs;
+    lerComandosDaPlanilha();
   }
 }
